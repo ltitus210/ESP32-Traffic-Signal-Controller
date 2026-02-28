@@ -9,7 +9,7 @@
 //
 // Mine happens to be HIGH-level trigger. If yours is LOW-level trigger, set ACTIVE_LOW to true.
 
-// I'm using GPIO pins 16-18. The lables on the silkscreen may differ based on the ESP32 devkit manufacture and revision.
+// I'm using GPIO pins 16-18. The lables on the silkscreen may differ based on the ESP32 devkit manufacturer and revision.
 // My pinout: https://lastminuteengineers.com/esp32-pinout-reference/#esp32-gpio-pins
 static const int PIN_RED    = 18;   // D18 on silkscreen
 static const int PIN_YELLOW = 17;   // TX2 on silkscreen
