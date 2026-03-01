@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <WebServer.h>
+
 #include "wifi_helper.h"
 #include "web_control.h"
+#include "wifi_config.h"
 
 // ===== MOSFET / light pins =====
 static const int PIN_RED    = 18;
@@ -9,6 +11,7 @@ static const int PIN_YELLOW = 17;
 static const int PIN_GREEN  = 16;
 
 // Most MOSFET trigger boards are LOW-level trigger:
+// IN LOW = ON, IN HIGH = OFF
 static const bool ACTIVE_LOW = false;
 
 // ===== Web server =====
@@ -18,21 +21,29 @@ WebServer server(80);
 volatile uint32_t GREEN_MS  = 12000;
 volatile uint32_t YELLOW_MS = 3000;
 volatile uint32_t RED_MS    = 12000;
+
+// Optional short all-red clearance (used in US pattern)
 static const uint32_t ALL_RED_MS = 500;
 
+// Pattern: 0 = US, 1 = DE (German)
+volatile uint8_t PATTERN_MODE = 0;
+
 // ===== Traffic light state machine =====
-enum State { ST_GREEN, ST_YELLOW, ST_ALL_RED_1, ST_RED, ST_ALL_RED_2 };
+enum State { ST_GREEN, ST_YELLOW, ST_ALL_RED, ST_RED, ST_RED_YELLOW };
 static State state = ST_GREEN;
 static uint32_t stateStart = 0;
 
+// Used only for US pattern to decide where ALL_RED goes next
+static bool allRedToGreen = false;
+
 const char* stateName() {
   switch (state) {
-    case ST_GREEN: return "GREEN";
-    case ST_YELLOW: return "YELLOW";
-    case ST_ALL_RED_1: return "ALL_RED";
-    case ST_RED: return "RED";
-    case ST_ALL_RED_2: return "ALL_RED";
-    default: return "?";
+    case ST_GREEN:      return "GREEN";
+    case ST_YELLOW:     return "YELLOW";
+    case ST_RED:        return "RED";
+    case ST_RED_YELLOW: return "RED+YELLOW";
+    case ST_ALL_RED:    return "ALL_RED";
+    default:            return "?";
   }
 }
 
@@ -49,12 +60,30 @@ void setLights(bool redOn, bool yellowOn, bool greenOn) {
 void enter(State s) {
   state = s;
   stateStart = millis();
+
   switch (state) {
-    case ST_GREEN:     setLights(false, false, true);  break;
-    case ST_YELLOW:    setLights(false, true,  false); break;
-    case ST_ALL_RED_1: setLights(true,  false, false); break;
-    case ST_RED:       setLights(true,  false, false); break;
-    case ST_ALL_RED_2: setLights(true,  false, false); break;
+    case ST_GREEN:
+      setLights(false, false, true);
+      break;
+
+    case ST_YELLOW:
+      setLights(false, true, false);
+      break;
+
+    case ST_RED:
+      setLights(true, false, false);
+      break;
+
+    case ST_RED_YELLOW:
+      // German pre-green: red + yellow together
+      setLights(true, true, false);
+      break;
+
+    case ST_ALL_RED:
+      // For our wiring, "ALL_RED" is still just red ON (single head).
+      // Keeping this state for a short clearance period in the US pattern.
+      setLights(true, false, false);
+      break;
   }
 }
 
@@ -65,10 +94,15 @@ void setup() {
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_YELLOW, OUTPUT);
   pinMode(PIN_GREEN, OUTPUT);
+
+  // Force all OFF at boot
   setLights(false, false, false);
 
-  // Load persisted timings (optional but nice)
+  // Load persisted timings (if present)
   loadTimings((uint32_t&)GREEN_MS, (uint32_t&)YELLOW_MS, (uint32_t&)RED_MS);
+
+  // Load persisted pattern (0=US, 1=DE)
+  PATTERN_MODE = loadPattern(0);
 
   // Start WiFi (STA if creds work, otherwise AP setup mode)
   wifiBegin();
@@ -77,39 +111,89 @@ void setup() {
   Serial.println(isApMode() ? "SETUP AP" : "WIFI STA");
 
   if (isApMode()) {
-    Serial.print("AP SSID: "); Serial.println("TrafficLight-Setup");
-    Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+    Serial.print("AP SSID: ");
+    Serial.println("TrafficLight-Setup");
+    Serial.print("AP IP: ");
+    Serial.println(WiFi.softAPIP());
     Serial.println("Open: http://192.168.4.1/settings");
   } else {
-    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
     Serial.println("Open: http://<ip>/");
   }
 
   setupWebRoutes();
-  enter(ST_GREEN);
+
+  // Start in a sensible state for the selected pattern
+  allRedToGreen = false;
+  enter(PATTERN_MODE == 0 ? ST_GREEN : ST_RED);
 }
 
 void loop() {
+  // Keep WiFi alive + serve HTTP
   wifiMaintain();
   server.handleClient();
 
   uint32_t elapsed = millis() - stateStart;
 
-  switch (state) {
-    case ST_GREEN:
-      if (elapsed >= (uint32_t)GREEN_MS) enter(ST_YELLOW);
-      break;
-    case ST_YELLOW:
-      if (elapsed >= (uint32_t)YELLOW_MS) enter(ST_ALL_RED_1);
-      break;
-    case ST_ALL_RED_1:
-      if (elapsed >= ALL_RED_MS) enter(ST_RED);
-      break;
-    case ST_RED:
-      if (elapsed >= (uint32_t)RED_MS) enter(ST_ALL_RED_2);
-      break;
-    case ST_ALL_RED_2:
-      if (elapsed >= ALL_RED_MS) enter(ST_GREEN);
-      break;
+  // Typical German red+yellow duration
+  static const uint32_t RED_YELLOW_MS = 1000;
+
+  if (PATTERN_MODE == 0) {
+    // ===== US Pattern =====
+    // GREEN -> YELLOW -> ALL_RED -> RED -> ALL_RED -> GREEN
+    switch (state) {
+      case ST_GREEN:
+        if (elapsed >= (uint32_t)GREEN_MS) enter(ST_YELLOW);
+        break;
+
+      case ST_YELLOW:
+        if (elapsed >= (uint32_t)YELLOW_MS) {
+          allRedToGreen = false;   // after ALL_RED go to RED
+          enter(ST_ALL_RED);
+        }
+        break;
+
+      case ST_ALL_RED:
+        if (elapsed >= ALL_RED_MS) {
+          enter(allRedToGreen ? ST_GREEN : ST_RED);
+        }
+        break;
+
+      case ST_RED:
+        if (elapsed >= (uint32_t)RED_MS) {
+          allRedToGreen = true;    // after ALL_RED go to GREEN
+          enter(ST_ALL_RED);
+        }
+        break;
+
+      default:
+        enter(ST_GREEN);
+        break;
+    }
+  } else {
+    // ===== German Pattern =====
+    // RED -> RED+YELLOW -> GREEN -> YELLOW -> RED
+    switch (state) {
+      case ST_RED:
+        if (elapsed >= (uint32_t)RED_MS) enter(ST_RED_YELLOW);
+        break;
+
+      case ST_RED_YELLOW:
+        if (elapsed >= RED_YELLOW_MS) enter(ST_GREEN);
+        break;
+
+      case ST_GREEN:
+        if (elapsed >= (uint32_t)GREEN_MS) enter(ST_YELLOW);
+        break;
+
+      case ST_YELLOW:
+        if (elapsed >= (uint32_t)YELLOW_MS) enter(ST_RED);
+        break;
+
+      default:
+        enter(ST_RED);
+        break;
+    }
   }
 }

@@ -10,6 +10,23 @@ static const char* KEY_G = "g_ms";
 static const char* KEY_Y = "y_ms";
 static const char* KEY_R = "r_ms";
 
+static const char* KEY_PATTERN = "pattern"; // 0 = US, 1 = DE
+
+inline uint8_t loadPattern(uint8_t defaultVal = 0) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) return defaultVal;
+  uint8_t v = prefs.getUChar(KEY_PATTERN, defaultVal);
+  prefs.end();
+  return v;
+}
+
+inline void savePattern(uint8_t pattern) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) return;
+  prefs.putUChar(KEY_PATTERN, pattern);
+  prefs.end();
+}
+
 inline bool loadWifiCreds(String &ssid, String &pass) {
   Preferences prefs;
   if (!prefs.begin(NVS_NAMESPACE, true)) return false;
