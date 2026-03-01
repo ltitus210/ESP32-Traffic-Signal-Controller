@@ -25,8 +25,11 @@ volatile uint32_t RED_MS    = 12000;
 // Optional short all-red clearance (used in US pattern)
 static const uint32_t ALL_RED_MS = 500;
 
-// Pattern: 0 = US, 1 = DE (German)
+// Pattern: 0 = US, 1 = DE (German), 2 = CUSTOM (manual)
 volatile uint8_t PATTERN_MODE = 0;
+
+// Custom/manual bits (bit0=R, bit1=Y, bit2=G)
+volatile uint8_t CUSTOM_BITS = 0;
 
 // ===== Traffic light state machine =====
 enum State { ST_GREEN, ST_YELLOW, ST_ALL_RED, ST_RED, ST_RED_YELLOW };
@@ -37,6 +40,9 @@ static uint32_t stateStart = 0;
 static bool allRedToGreen = false;
 
 const char* stateName() {
+  if (PATTERN_MODE == 2) {
+    return "CUSTOM";
+  }
   switch (state) {
     case ST_GREEN:      return "GREEN";
     case ST_YELLOW:     return "YELLOW";
@@ -57,33 +63,36 @@ void setLights(bool redOn, bool yellowOn, bool greenOn) {
   writeChannel(PIN_GREEN, greenOn);
 }
 
+void applyCustomBits(uint8_t bits) {
+  bool r = (bits & 0x01) != 0;
+  bool y = (bits & 0x02) != 0;
+  bool g = (bits & 0x04) != 0;
+  setLights(r, y, g);
+}
+
 void enter(State s) {
   state = s;
   stateStart = millis();
 
   switch (state) {
-    case ST_GREEN:
-      setLights(false, false, true);
-      break;
+    case ST_GREEN:      setLights(false, false, true);  break;
+    case ST_YELLOW:     setLights(false, true,  false); break;
+    case ST_RED:        setLights(true,  false, false); break;
+    case ST_RED_YELLOW: setLights(true,  true,  false); break; // German pre-green
+    case ST_ALL_RED:    setLights(true,  false, false); break; // single-head "all red"
+  }
+}
 
-    case ST_YELLOW:
-      setLights(false, true, false);
-      break;
+void startPatternFromBeginning() {
+  allRedToGreen = false;
 
-    case ST_RED:
-      setLights(true, false, false);
-      break;
-
-    case ST_RED_YELLOW:
-      // German pre-green: red + yellow together
-      setLights(true, true, false);
-      break;
-
-    case ST_ALL_RED:
-      // For our wiring, "ALL_RED" is still just red ON (single head).
-      // Keeping this state for a short clearance period in the US pattern.
-      setLights(true, false, false);
-      break;
+  if (PATTERN_MODE == 0) {
+    enter(ST_GREEN);
+  } else if (PATTERN_MODE == 1) {
+    enter(ST_RED);
+  } else {
+    // Custom/manual
+    applyCustomBits(CUSTOM_BITS);
   }
 }
 
@@ -98,11 +107,10 @@ void setup() {
   // Force all OFF at boot
   setLights(false, false, false);
 
-  // Load persisted timings (if present)
+  // Load persisted settings
   loadTimings((uint32_t&)GREEN_MS, (uint32_t&)YELLOW_MS, (uint32_t&)RED_MS);
-
-  // Load persisted pattern (0=US, 1=DE)
-  PATTERN_MODE = loadPattern(0);
+  PATTERN_MODE = loadPattern(0);            // 0=US default
+  CUSTOM_BITS  = loadCustomBits(0);         // default all off
 
   // Start WiFi (STA if creds work, otherwise AP setup mode)
   wifiBegin();
@@ -124,15 +132,22 @@ void setup() {
 
   setupWebRoutes();
 
-  // Start in a sensible state for the selected pattern
-  allRedToGreen = false;
-  enter(PATTERN_MODE == 0 ? ST_GREEN : ST_RED);
+  // Start the selected pattern
+  startPatternFromBeginning();
 }
 
 void loop() {
   // Keep WiFi alive + serve HTTP
   wifiMaintain();
   server.handleClient();
+
+  // Custom mode: no timing/state machine, just hold the chosen outputs
+  if (PATTERN_MODE == 2) {
+    // Apply any updated bits (in case changed via web)
+    applyCustomBits(CUSTOM_BITS);
+    delay(5);
+    return;
+  }
 
   uint32_t elapsed = millis() - stateStart;
 
