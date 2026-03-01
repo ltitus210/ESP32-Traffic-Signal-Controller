@@ -1,34 +1,42 @@
-// ESP32 Traffic Signal Controller
-//
-// I am using the ESP32 with a Relay or MOSFET board so that the low powered 3.3V logic signals
-// of the GPIO Pins can control higher voltage AC/DC traffic light modules directly.
-//
-// IMPORTANT: Many Relay/MOSFET trigger boards are "LOW-level trigger":
-//   IN = LOW  -> ON
-//   IN = HIGH -> OFF
-//
-// Mine happens to be HIGH-level trigger. If yours is LOW-level trigger, set ACTIVE_LOW to true.
+#include <Arduino.h>
+#include <WebServer.h>
+#include "wifi_helper.h"
+#include "web_control.h"
 
-// I'm using GPIO pins 16-18. The lables on the silkscreen may differ based on the ESP32 devkit manufacturer and revision.
-// My pinout: https://lastminuteengineers.com/esp32-pinout-reference/#esp32-gpio-pins
-static const int PIN_RED    = 18;   // D18 on silkscreen
-static const int PIN_YELLOW = 17;   // TX2 on silkscreen
-static const int PIN_GREEN  = 16;   // RX2 on silkscreen
+// ===== MOSFET / light pins =====
+static const int PIN_RED    = 18;
+static const int PIN_YELLOW = 17;
+static const int PIN_GREEN  = 16;
 
-static const bool ACTIVE_LOW = false;   // <-- change to true if your board is low-trigger
+// Most MOSFET trigger boards are LOW-level trigger:
+static const bool ACTIVE_LOW = false;
 
-// Typical-ish US timing
-static const uint32_t GREEN_MS   = 10000;
-static const uint32_t YELLOW_MS  = 3000;
-static const uint32_t RED_MS     = 10000;
-static const uint32_t ALL_RED_MS = 500; // Delayed Green
+// ===== Web server =====
+WebServer server(80);
 
-enum State { GREEN, YELLOW, ALL_RED_1, RED, ALL_RED_2 };
-State state = GREEN;
-uint32_t stateStart = 0;
+// ===== Timing (editable & persisted) =====
+volatile uint32_t GREEN_MS  = 12000;
+volatile uint32_t YELLOW_MS = 3000;
+volatile uint32_t RED_MS    = 12000;
+static const uint32_t ALL_RED_MS = 500;
+
+// ===== Traffic light state machine =====
+enum State { ST_GREEN, ST_YELLOW, ST_ALL_RED_1, ST_RED, ST_ALL_RED_2 };
+static State state = ST_GREEN;
+static uint32_t stateStart = 0;
+
+const char* stateName() {
+  switch (state) {
+    case ST_GREEN: return "GREEN";
+    case ST_YELLOW: return "YELLOW";
+    case ST_ALL_RED_1: return "ALL_RED";
+    case ST_RED: return "RED";
+    case ST_ALL_RED_2: return "ALL_RED";
+    default: return "?";
+  }
+}
 
 inline void writeChannel(int pin, bool on) {
-  // active-low: ON=LOW, OFF=HIGH
   digitalWrite(pin, ACTIVE_LOW ? (on ? LOW : HIGH) : (on ? HIGH : LOW));
 }
 
@@ -41,49 +49,67 @@ void setLights(bool redOn, bool yellowOn, bool greenOn) {
 void enter(State s) {
   state = s;
   stateStart = millis();
-
   switch (state) {
-    case GREEN:      setLights(false, false, true);  break;
-    case YELLOW:     setLights(false, true,  false); break;
-    case ALL_RED_1:  setLights(true,  false, false); break;
-    case RED:        setLights(true,  false, false); break;
-    case ALL_RED_2:  setLights(true,  false, false); break;
+    case ST_GREEN:     setLights(false, false, true);  break;
+    case ST_YELLOW:    setLights(false, true,  false); break;
+    case ST_ALL_RED_1: setLights(true,  false, false); break;
+    case ST_RED:       setLights(true,  false, false); break;
+    case ST_ALL_RED_2: setLights(true,  false, false); break;
   }
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(200);
+
   pinMode(PIN_RED, OUTPUT);
   pinMode(PIN_YELLOW, OUTPUT);
   pinMode(PIN_GREEN, OUTPUT);
-
-  // Force all OFF at boot
   setLights(false, false, false);
 
-  enter(GREEN);
+  // Load persisted timings (optional but nice)
+  loadTimings((uint32_t&)GREEN_MS, (uint32_t&)YELLOW_MS, (uint32_t&)RED_MS);
+
+  // Start WiFi (STA if creds work, otherwise AP setup mode)
+  wifiBegin();
+
+  Serial.print("Mode: ");
+  Serial.println(isApMode() ? "SETUP AP" : "WIFI STA");
+
+  if (isApMode()) {
+    Serial.print("AP SSID: "); Serial.println("TrafficLight-Setup");
+    Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+    Serial.println("Open: http://192.168.4.1/settings");
+  } else {
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.println("Open: http://<ip>/");
+  }
+
+  setupWebRoutes();
+  enter(ST_GREEN);
 }
 
 void loop() {
+  wifiMaintain();
+  server.handleClient();
+
   uint32_t elapsed = millis() - stateStart;
 
   switch (state) {
-    case GREEN:
-      if (elapsed >= GREEN_MS) enter(YELLOW);
+    case ST_GREEN:
+      if (elapsed >= (uint32_t)GREEN_MS) enter(ST_YELLOW);
       break;
-
-    case YELLOW:
-      if (elapsed >= YELLOW_MS) enter(ALL_RED_1);
+    case ST_YELLOW:
+      if (elapsed >= (uint32_t)YELLOW_MS) enter(ST_ALL_RED_1);
       break;
-
-    case ALL_RED_1:
-      if (elapsed >= ALL_RED_MS) enter(RED);
+    case ST_ALL_RED_1:
+      if (elapsed >= ALL_RED_MS) enter(ST_RED);
       break;
-
-    case RED:
-      if (elapsed >= RED_MS) enter(ALL_RED_2);
+    case ST_RED:
+      if (elapsed >= (uint32_t)RED_MS) enter(ST_ALL_RED_2);
       break;
-
-    case ALL_RED_2:
-      if (elapsed >= ALL_RED_MS) enter(GREEN);
+    case ST_ALL_RED_2:
+      if (elapsed >= ALL_RED_MS) enter(ST_GREEN);
       break;
   }
 }
